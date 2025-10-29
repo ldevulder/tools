@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+#
+# Wrapper to run "buggy" X11 application with Xwayland in rootful mode
+# Inspired by code found here: https://bennett.dev/rootful-xwayland/
+# Added some improvements to fix issues in some edge cases
+
+function clean_exit() {
+  # Delete temp file if needed
+  if [[ -n "${tmp_file}" ]]; then
+    echo "Deleting ${tmp_file}..."
+    rm -f ${tmp_file}
+  fi
+ 
+  # Kill Xwayland if needed
+  if [[ -n ${xserver_pid} ]]; then
+    echo "Killing X process ${tmp_file}..."
+    kill ${xserver_pid} 2>/dev/null
+  fi
+
+  exit ${exit_rc:-0}
+}
+
+# Must be the (pretty much!) first command to handle exit correctly!
+trap clean_exit EXIT
+
+# Program to execute
+declare file="$1"; shift
+declare bin_file=$(which ${file} 2>/dev/null)
+
+# Title
+declare app_name="$@"
+
+# Error if binary file does not exist
+if ! [[ -x "${file}" || -n "${bin_file}" ]]; then
+  echo "'${file}' does not exist or is not executable!" >&2
+  exit ${exit_rc:=1}
+fi
+
+# Create a random file for the Openbox config to live in
+declare tmp_file=$(mktemp)
+
+# Choose a random port number for the X11 display to open on
+declare ndisplay=${RANDOM}
+
+# Dump some Openbox config so that the Reaper application is maximized and doesn't have a window border when it is opened.
+cat << EOT >> ${tmp_file}
+<openbox_config>
+	<applications>
+		<application name="${app_name}" title="${app_name}">
+		  <decor>no</decor>
+			<fullscreen>yes</fullscreen>
+			<maximized>yes</maximized>
+		</application>
+	</applications>
+</openbox_config>
+EOT
+
+# Start the Xwayland process on the random display port
+Xwayland -geometry 1920x1080 -decorate :${ndisplay} 2>/dev/null &
+xserver_pid=$!
+if ! ps -q ${xserver_pid} -o comm= >/dev/null; then
+  echo "'No XDisplay available!" >&2
+  exit ${exit_rc:=1}
+fi
+
+# Wait a bit for Xserver to be started
+declare no_xserver=0 loop=0 max=5
+declare cmd="timeout 1s xset -display :${ndisplay} q"
+while true; do
+	(( loop++ >= max )) && no_xserver=1 && break
+	${cmd} 2>/dev/null | grep -q 'default colormap:' && break
+done
+
+if (( no_xserver )) ; then
+  echo "XDisplay ':${ndisplay}' not available!" >&2
+  exit ${exit_rc:=1}
+fi
+
+# Start app in Openbox under Xwayland with the provided config
+DISPLAY=:${ndisplay} openbox --config-file ${tmp_file} --startup ${bin_file} 2>/dev/null
