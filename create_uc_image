@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+#
+# Tool to help creation of OS image with Elemental3
+
+function clean_exit() {
+  # Detaching loop device if needed
+  if [[ -n "${NBD_DEV}" ]]; then
+    echo "- Detaching device ${NBD_DEV}..."
+    sudo qemu-nbd -d ${NBD_DEV} >/dev/null 2>&1
+    sudo rmmod nbd >/dev/null 2>&1
+  fi
+}
+
+# Must be the (pretty much!) first command to handle exit correctly!
+trap clean_exit EXIT
+
+# Stop on the first error!
+set -e
+
+function quit() {
+  declare msg=$1
+  declare rc=$2
+
+  echo -e ${msg}
+
+  exit ${rc:-0}
+}
+
+# Set debug mode if needed
+(( DEBUG )) && set -x
+
+# Variable(s)
+# If needed, variables can be superseded on the cmdline or in shell
+#
+# For example:
+# $ declare OS_IMG=dir:///var/lib/containers/storage/overlay/8978de985ad7f7fb29ea7a8e79ee8575618415305166cba6f9d61a0713b5aaa2/merged
+# $ declare SYSEXT_PATH=${HOME}/local_systext
+# $ create_hdd_image.sh
+#
+# Or:
+# $ CTL_CMD=my-ctl-bin create_hdd_image.sh
+#
+declare DEBUG RAW_ARCH KEEP_FILES SYSEXT_CMDLINE
+declare SYSEXT_TAR=${HOME}/sysext.tar.gz
+
+: CTL_CMD=${CTL_CMD:=elemental3ctl}
+: HDD_IMG=${HDD_IMG:=elemental3-test-hdd.qcow2}
+: OS_IMG=${OS_IMG:=oci://registry.opensuse.org/devel/unifiedcore/tumbleweed/containers/uc-base-os-kernel-default:latest}
+: SYSEXT_PATH=${SYSEXT_PATH:=https://dist.suse.de/ibs/Devel:/UnifiedCore:/Main:/ToTest/sysexts}
+: ETC_EXT=${ETC_EXT:=root/etc/extensions}
+: K8S_DISTRI=${K8S_DISTRI:=rke2}
+: K8S_VERSION=${K8S_VERSION:=1.33}
+: ARCH=${ARCH:=$(uname -m)}
+: HDD_SIZE=${HDD_SIZE:=30G}
+: CONFIG=${CONFIG:=config.sh}
+: CONFIG_ISO=${CONFIG_ISO:=config_iso.sh}
+: PERMISSIVE=${PERMISSIVE:=yes}
+: NBD_DEV=${NBD_DEV:=/dev/nbd0}
+: ISO=${ISO:=}
+: IBS=${IBS:=}
+: NO_SYSEXT=${NO_SYSEXT:=}
+
+# Define OS image for specific case(s)
+if [[ -n "${IBS}" ]]; then
+  # Default value if IBS is set
+  # Note that OS_IMG can be forced on the command line for specific version
+  OS_IMG="oci://registry.suse.de/devel/unifiedcore/main/totest/containers/uc-base-os-kernel-default:0.0.1"
+fi
+
+# Define architecture for the sysexts
+case ${ARCH} in
+  aarch64)
+    RAW_ARCH="_arm64.raw"
+    ;;
+  x86_64)
+    RAW_ARCH="_x86-64.raw"
+    ;;
+  *)
+    # Error if we reach that line
+    quit "Architecture $(uname -m) is not supported!" 1
+    ;;
+esac
+
+# For the use of the default one for sudo command
+CTL_CMD=$(which ${CTL_CMD})
+
+# Log message to know which version is used
+echo "- Elemental version used: $(${CTL_CMD} version)"
+
+# Create the HDD image if needed
+echo "- Creating a ${HDD_SIZE} HDD image ${HDD_IMG}..."
+[[ -e ${HDD_IMG} ]] && rm -f ${HDD_IMG}
+qemu-img create -f qcow2 ${HDD_IMG} ${HDD_SIZE} 
+
+# Only if we want to add/use sysexts
+if [[ -z "${NO_SYSEXT}" ]]; then
+  # Clean sysexts
+  echo "- Cleaning ${ETC_EXT}..."
+  rm -rf ${ETC_EXT}/*.raw
+  mkdir -p ${ETC_EXT}
+
+  # Get sysexts list
+  if [[ -d ${SYSEXT_PATH} ]]; then
+    # Copy sysext
+    for SYSEXT in ${SYSEXT_PATH}/*${RAW_ARCH}; do
+      echo "- Copying ${SYSEXT##*/} extension..."
+      cp ${SYSEXT} ${ETC_EXT}/${SYSEXT##*/}
+    done
+  else
+    echo "- Getting SysExt list..."
+    SYSEXT_LIST=$(curl -sf ${SYSEXT_PATH}/ | sed -n "s/.*href=\"\(.*${RAW_ARCH}\)\">.*/\1/p")
+
+    # Download sysext
+    for SYSEXT in ${SYSEXT_LIST}; do
+      if [[ "${SYSEXT}" =~ "${K8S_DISTRI}" ]]; then
+        # Only use K8S_VERSION in this case, not when local path is used
+        [[ "${SYSEXT}" =~ "${K8S_DISTRI}-${K8S_VERSION}" ]] || continue 
+      fi
+      echo "- Downloading ${SYSEXT} extension..."
+      curl -sL ${SYSEXT_PATH}/${SYSEXT} -o ${ETC_EXT}/${SYSEXT}
+    done
+  fi
+
+  # Create the sysext tar image, raw files should be put in root/etc/extensions
+  echo "- Creating SysExt tarball..."
+  tar cavf ${SYSEXT_TAR} -C root .
+
+  # Command line
+  SYSEXT_CMDLINE="--overlay tar://${SYSEXT_TAR}"
+fi
+
+# Mount HDD device
+echo "- Mount HDD device..."
+sudo modprobe nbd \
+  && sudo qemu-nbd -c ${NBD_DEV} ${HDD_IMG} 
+
+# Clean the HDD image
+echo "- Wiping device ${NBD_DEV}..."
+sudo wipefs -a ${NBD_DEV}
+
+# Set SELinux un permissive mode if needed
+if [[ -n "${PERMISSIVE}" ]]; then
+  echo "- Set SELinux in permissive mode..."
+  sudo setenforce permissive
+fi
+
+# Create the OS image
+# NOTE: arguments passed on the cmdline will be added here!
+if [[ -n "${ISO}" ]]; then
+  echo "- Creating UnifiedCore OS ISO image..."
+  sudo ${CTL_CMD} --debug build-iso \
+    --output build_iso \
+    --os-image ${OS_IMG} \
+    --overlay dir://${ETC_EXT%/*} \
+    --cmdline "root=live:CDLABEL=LIVE rd.live.overlay.overlayfs=1 console=ttyS0" \
+    --config ${CONFIG_ISO} \
+    --install-target ${NBD_DEV} \
+    --install-overlay tar://${SYSEXT_TAR}\
+    --install-config ${CONFIG} \ 
+    --install-cmdline "root=LABEL=SYSTEM console=ttyS0" "$@"
+else
+  echo "- Creating UnifiedCore OS RAW image..."
+  sudo ${CTL_CMD} --debug install \
+    --os-image ${OS_IMG} \
+    ${SYSEXT_CMDLINE} \
+    --target ${NBD_DEV} "$@"
+    #--config ${CONFIG} \
+fi
+
+exit 0
+
+# Re-set SELinux un enforcing mode if needed
+if [[ -n "${PERMISSIVE}" ]]; then
+  echo "- Set SELinux in enforcing mode..."
+  sudo setenforce enforcing
+fi
+
+# Clean all
+if [[ -z "${KEEP_FILES}" ]]; then
+  echo "- Cleaning all..."
+  rm -f ${ETC_EXT}/*.raw ${SYSEXT_TAR} ${HDD_IMG}.raw
+fi
+
+# Done!
+echo "- DONE!"
+exit 0
