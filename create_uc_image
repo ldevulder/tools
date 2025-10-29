@@ -162,9 +162,9 @@ else
   echo "- Creating UnifiedCore OS RAW image..."
   sudo ${CTL_CMD} --debug install \
     --os-image ${OS_IMG} \
+    --config ${CONFIG} \
     ${SYSEXT_CMDLINE} \
     --target ${NBD_DEV} "$@"
-    #--config ${CONFIG} \
 fi
 
 exit 0
